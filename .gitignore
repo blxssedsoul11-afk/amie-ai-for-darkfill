@@ -53,3 +53,5 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+artifacts/amie-bot/data/amie-memory.json
+artifacts/amie-bot/data/amie-memory.json.tmp

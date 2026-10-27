@@ -1,28 +1,30 @@
-# [Project name]
+# Amie Discord Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Amie is a witty catgirl maid AI companion with text and voice replies for two allowlisted Discord users.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `pnpm --filter @workspace/amie-bot run dev` — run Amie
+- `pnpm --filter @workspace/amie-bot run typecheck` — typecheck Amie
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required secrets: `DISCORD_TOKEN`, `MISTRAL_API_KEY`, `FISH_AUDIO_API_KEY`
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Discord bot: discord.js 14
+- AI replies: Mistral API
+- Voice replies: Fish Audio API
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- Bot source: `artifacts/amie-bot/src`
+- Amie's shared memory is one file for both authorized users; start it empty and do not create per-user memory files.
+- The message handler must reject every Discord user except Chakala and Darkfill before reading message content.
+- Remove all legacy slash and prefix commands; the bot's ready event clears registered Discord commands.
 
 ## Architecture decisions
 
