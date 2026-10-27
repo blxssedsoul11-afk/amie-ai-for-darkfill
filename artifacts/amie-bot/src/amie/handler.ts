@@ -1,4 +1,4 @@
-import type { Message } from "discord.js";
+import { PermissionFlagsBits, type Message } from "discord.js";
 import {
   AMIE_SLEEP_PHRASES,
   AMIE_WAKE_PHRASES,
@@ -12,6 +12,8 @@ import {
 } from "./config.js";
 import { prepareSpeechText, sendVoiceMessage, synthesizeVoice, wantsVoiceReply } from "./fish.js";
 import { amieMemory } from "./memory.js";
+import { joinAmieVoiceChannel, leaveAmieVoiceChannel } from "./voiceConnection.js";
+import { parseVoiceChannelAction, type VoiceChannelAction } from "./voiceIntent.js";
 import {
   callMistral,
   MistralRateLimitError,
@@ -125,6 +127,7 @@ function buildSystemPrompt(): string {
     "You have two equal owners, Chakala and Darkfill. They share one memory file; do not treat either as the primary owner.",
     "Only answer when one of those two people is clearly addressing or including you. If a message is not for you, reply with exactly [SKIP].",
     "You have no commands or server-management abilities. Never emit command tags or claim that you changed Discord settings, moderated users, or performed other external actions.",
+    "Do not claim to join or leave voice; explicit voice-channel requests are handled by a separate bot action.",
     "You can understand images attached to a message. Describe them naturally when relevant.",
     "When someone explicitly asks for a voice reply, answer with concise, natural text suitable for speech. Avoid markdown, tables, long lists, and URLs.",
     `Authorized owners: ${owners}.`,
@@ -246,12 +249,58 @@ async function sendReply(message: Message, text: string): Promise<void> {
   await sendText(message, text);
 }
 
+async function handleVoiceChannelAction(
+  message: Message,
+  action: VoiceChannelAction,
+): Promise<void> {
+  const guild = message.guild;
+  if (!guild) {
+    await sendText(message, "Tell me in the server chat while you're in voice, and I can join.");
+    return;
+  }
+
+  if (action === "leave") {
+    const left = leaveAmieVoiceChannel(guild.id);
+    await sendText(message, left ? "I've left the voice channel." : "I'm not in a voice channel right now.");
+    return;
+  }
+
+  const channel = message.member?.voice.channel;
+  if (!channel) {
+    await sendText(message, "Join a voice channel first, then tell me to join.");
+    return;
+  }
+
+  const botMember = guild.members.me;
+  if (!botMember || !channel.permissionsFor(botMember).has(PermissionFlagsBits.Connect)) {
+    await sendText(message, "I need permission to connect to that voice channel.");
+    return;
+  }
+
+  try {
+    const result = await joinAmieVoiceChannel(guild, channel);
+    await sendText(
+      message,
+      result === "already" ? `I'm already in ${channel.name}.` : `I'm in ${channel.name} now.`,
+    );
+  } catch (error) {
+    console.warn("[Amie] Could not join the requested voice channel:", error);
+    await sendText(message, "I couldn't connect. Please check that I have permission to join that channel.");
+  }
+}
+
 export async function handleAmieMessage(message: Message): Promise<boolean> {
   if (message.author.bot || !isAuthorizedUser(message.author.id)) return false;
 
+  const content = message.content.trim();
+  const voiceAction = parseVoiceChannelAction(content);
+  if (voiceAction) {
+    await handleVoiceChannelAction(message, voiceAction);
+    return true;
+  }
+
   const guildId = getSessionGuildId(message);
   const channelId = message.channelId;
-  const content = message.content.trim();
   const authorId = message.author.id;
   const session = amieState.getSession(guildId, channelId);
 
