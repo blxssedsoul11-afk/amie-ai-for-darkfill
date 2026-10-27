@@ -12,7 +12,12 @@ import {
 } from "./config.js";
 import { prepareSpeechText, sendVoiceMessage, synthesizeVoice, wantsVoiceReply } from "./fish.js";
 import { amieMemory } from "./memory.js";
-import { joinAmieVoiceChannel, leaveAmieVoiceChannel } from "./voiceConnection.js";
+import {
+  isAmieVoiceConnectionReady,
+  joinAmieVoiceChannel,
+  leaveAmieVoiceChannel,
+  speakInAmieVoiceChannel,
+} from "./voiceConnection.js";
 import { parseVoiceChannelAction, type VoiceChannelAction } from "./voiceIntent.js";
 import {
   callMistral,
@@ -128,6 +133,7 @@ function buildSystemPrompt(): string {
     "Only answer when one of those two people is clearly addressing or including you. If a message is not for you, reply with exactly [SKIP].",
     "You have no commands or server-management abilities. Never emit command tags or claim that you changed Discord settings, moderated users, or performed other external actions.",
     "Do not claim to join or leave voice; explicit voice-channel requests are handled by a separate bot action.",
+    "When connected to voice, your replies in the server's AI chat are spoken aloud. You can speak but cannot hear voice-channel audio.",
     "You can understand images attached to a message. Describe them naturally when relevant.",
     "When someone explicitly asks for a voice reply, answer with concise, natural text suitable for speech. Avoid markdown, tables, long lists, and URLs.",
     `Authorized owners: ${owners}.`,
@@ -227,26 +233,73 @@ async function sendText(message: Message, text: string): Promise<void> {
   }
 }
 
+async function sendVoiceReplyToTextChannel(message: Message, audio: Awaited<ReturnType<typeof synthesizeVoice>>): Promise<void> {
+  try {
+    await sendVoiceMessage(message.channelId, audio);
+  } catch (error) {
+    console.warn("[Amie] Native voice-message delivery failed; sending an audio attachment.", error);
+    const channel = message.channel;
+    if (!("send" in channel)) throw new Error("This Discord channel cannot receive attachments.");
+    await channel.send({
+      files: [{ attachment: audio.audio, name: "amie-voice.ogg" }],
+    });
+  }
+}
+
+async function speakTextInVoiceChannel(guildId: string, text: string): Promise<boolean> {
+  if (!isAmieVoiceConnectionReady(guildId)) return false;
+  try {
+    const audio = await synthesizeVoice(prepareSpeechText(text));
+    return await speakInAmieVoiceChannel(guildId, audio);
+  } catch (error) {
+    console.error("[Amie] Could not speak in the voice channel:", error);
+    return false;
+  }
+}
+
 async function sendReply(message: Message, text: string): Promise<void> {
-  if (wantsVoiceReply(message.content)) {
+  const voiceReplyRequested = wantsVoiceReply(message.content);
+  const guildId = message.guildId;
+  const connectedToVoice = guildId ? isAmieVoiceConnectionReady(guildId) : false;
+
+  if (!connectedToVoice && !voiceReplyRequested) {
+    await sendText(message, text);
+    return;
+  }
+
+  if (connectedToVoice) await sendText(message, text);
+
+  let audio: Awaited<ReturnType<typeof synthesizeVoice>>;
+  try {
+    audio = await synthesizeVoice(prepareSpeechText(text));
+  } catch (error) {
+    console.error("[Amie] Voice reply failed:", error);
+    if (!connectedToVoice) await sendText(message, text);
+    return;
+  }
+
+  if (connectedToVoice && guildId) {
     try {
-      const audio = await synthesizeVoice(prepareSpeechText(text));
-      try {
-        await sendVoiceMessage(message.channelId, audio);
-      } catch (error) {
-        console.warn("[Amie] Native voice-message delivery failed; sending an audio attachment.", error);
-        const channel = message.channel;
-        if (!("send" in channel)) throw new Error("This Discord channel cannot receive attachments.");
-        await channel.send({
-          files: [{ attachment: audio.audio, name: "amie-voice.ogg" }],
+      const spoken = await speakInAmieVoiceChannel(guildId, audio);
+      if (spoken) return;
+      throw new Error("Amie is no longer connected to voice.");
+    } catch (error) {
+      console.error("[Amie] Could not play the reply in voice:", error);
+      if (voiceReplyRequested) {
+        await sendVoiceReplyToTextChannel(message, audio).catch((fallbackError: unknown) => {
+          console.error("[Amie] Could not send a voice-message fallback:", fallbackError);
         });
       }
       return;
-    } catch (error) {
-      console.error("[Amie] Voice reply failed; falling back to text:", error);
     }
   }
-  await sendText(message, text);
+
+  try {
+    await sendVoiceReplyToTextChannel(message, audio);
+  } catch (error) {
+    console.error("[Amie] Voice reply failed; falling back to text:", error);
+    await sendText(message, text);
+  }
 }
 
 async function handleVoiceChannelAction(
@@ -260,6 +313,9 @@ async function handleVoiceChannelAction(
   }
 
   if (action === "leave") {
+    if (isAmieVoiceConnectionReady(guild.id)) {
+      await speakTextInVoiceChannel(guild.id, "Okay, I'll leave now.");
+    }
     const left = leaveAmieVoiceChannel(guild.id);
     await sendText(message, left ? "I've left the voice channel." : "I'm not in a voice channel right now.");
     return;
@@ -272,17 +328,21 @@ async function handleVoiceChannelAction(
   }
 
   const botMember = guild.members.me;
-  if (!botMember || !channel.permissionsFor(botMember).has(PermissionFlagsBits.Connect)) {
-    await sendText(message, "I need permission to connect to that voice channel.");
+  const permissions = botMember ? channel.permissionsFor(botMember) : null;
+  if (
+    !permissions?.has(PermissionFlagsBits.Connect) ||
+    !permissions.has(PermissionFlagsBits.Speak)
+  ) {
+    await sendText(message, "I need permission to connect and speak in that voice channel.");
     return;
   }
 
   try {
     const result = await joinAmieVoiceChannel(guild, channel);
-    await sendText(
-      message,
-      result === "already" ? `I'm already in ${channel.name}.` : `I'm in ${channel.name} now.`,
-    );
+    const response =
+      result === "already" ? `I'm already in ${channel.name}.` : `I'm in ${channel.name} now.`;
+    await sendText(message, response);
+    await speakTextInVoiceChannel(guild.id, response);
   } catch (error) {
     console.warn("[Amie] Could not join the requested voice channel:", error);
     await sendText(message, "I couldn't connect. Please check that I have permission to join that channel.");
