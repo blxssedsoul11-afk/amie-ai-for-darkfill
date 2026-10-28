@@ -13,11 +13,16 @@ import {
 import { Readable } from "node:stream";
 import type { Guild, VoiceBasedChannel } from "discord.js";
 import type { FishAudioResult } from "./fish.js";
+import {
+  attachAuthorizedVoiceReceiver,
+  type AuthorizedVoiceAudioHandler,
+} from "./voiceInput.js";
 
 const VOICE_READY_TIMEOUT_MS = 15_000;
 const audioPlayers = new Map<string, { connection: VoiceConnection; player: AudioPlayer }>();
 const speechQueues = new Map<string, Promise<void>>();
 const playbackVersions = new Map<string, number>();
+const voiceReceivers = new Map<string, { connection: VoiceConnection; cleanup: () => void }>();
 
 function resetVoicePlayback(guildId: string): void {
   playbackVersions.set(guildId, (playbackVersions.get(guildId) ?? 0) + 1);
@@ -25,21 +30,46 @@ function resetVoicePlayback(guildId: string): void {
   audioPlayers.delete(guildId);
 }
 
+function attachVoiceReceiver(
+  guildId: string,
+  connection: VoiceConnection,
+  onAudio: AuthorizedVoiceAudioHandler,
+): void {
+  const existing = voiceReceivers.get(guildId);
+  if (existing?.connection === connection) return;
+  existing?.cleanup();
+  voiceReceivers.set(guildId, {
+    connection,
+    cleanup: attachAuthorizedVoiceReceiver(connection, onAudio),
+  });
+}
+
+function detachVoiceReceiver(guildId: string): void {
+  voiceReceivers.get(guildId)?.cleanup();
+  voiceReceivers.delete(guildId);
+}
+
 export async function joinAmieVoiceChannel(
   guild: Guild,
   channel: VoiceBasedChannel,
+  onAudio: AuthorizedVoiceAudioHandler,
 ): Promise<"joined" | "already"> {
   const existing = getVoiceConnection(guild.id);
   if (existing?.joinConfig.channelId === channel.id) {
     try {
       await entersState(existing, VoiceConnectionStatus.Ready, VOICE_READY_TIMEOUT_MS);
+      attachVoiceReceiver(guild.id, existing, onAudio);
       return "already";
     } catch {
+      detachVoiceReceiver(guild.id);
       resetVoicePlayback(guild.id);
       existing.destroy();
     }
   } else {
-    if (existing) resetVoicePlayback(guild.id);
+    if (existing) {
+      detachVoiceReceiver(guild.id);
+      resetVoicePlayback(guild.id);
+    }
     existing?.destroy();
   }
 
@@ -47,12 +77,13 @@ export async function joinAmieVoiceChannel(
     channelId: channel.id,
     guildId: guild.id,
     adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: true,
+    selfDeaf: false,
     selfMute: false,
   });
 
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, VOICE_READY_TIMEOUT_MS);
+    attachVoiceReceiver(guild.id, connection, onAudio);
     return "joined";
   } catch (error) {
     connection.destroy();
@@ -63,6 +94,7 @@ export async function joinAmieVoiceChannel(
 export function leaveAmieVoiceChannel(guildId: string): boolean {
   const connection = getVoiceConnection(guildId);
   if (!connection) return false;
+  detachVoiceReceiver(guildId);
   resetVoicePlayback(guildId);
   connection.destroy();
   return true;

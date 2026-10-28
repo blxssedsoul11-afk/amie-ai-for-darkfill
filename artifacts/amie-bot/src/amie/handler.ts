@@ -22,6 +22,7 @@ import { parseVoiceChannelAction, type VoiceChannelAction } from "./voiceIntent.
 import {
   callMistral,
   MistralRateLimitError,
+  transcribeVoiceAudio,
   type MistralContentPart,
   type MistralMessage,
 } from "./mistral.js";
@@ -30,12 +31,16 @@ import { amieState, type ListeningSession } from "./state.js";
 const MISTRAL_TIMEOUT_MS = 30_000;
 
 function isWakePhrase(content: string): boolean {
-  const lower = content.toLowerCase().trim();
-  return AMIE_WAKE_PHRASES.some((phrase) => lower.includes(phrase)) || lower.startsWith("amie");
+  const lower = content.toLowerCase().replace(/[.,!?]+/g, " ").replace(/\s+/g, " ").trim();
+  return (
+    AMIE_WAKE_PHRASES.some((phrase) => lower.includes(phrase)) ||
+    lower.startsWith("amie") ||
+    /^(?:hey\s+)?amy\b/.test(lower)
+  );
 }
 
 function isSleepPhrase(content: string): boolean {
-  const lower = content.toLowerCase().trim();
+  const lower = content.toLowerCase().replace(/[.,!?]+/g, " ").replace(/\s+/g, " ").trim();
   return AMIE_SLEEP_PHRASES.some(
     (phrase) => lower === phrase || lower.startsWith(`${phrase} `) || lower.endsWith(` ${phrase}`),
   );
@@ -131,9 +136,10 @@ function buildSystemPrompt(): string {
     "Use no emojis by default. Rarely mirror an emoji when the user uses one or it clearly fits; if you do, use only ❤️💕😘🥳👀🫶🤞🤏👌🫵🙏💅, and never more than one per reply.",
     "You have two equal owners, Chakala and Darkfill. They share one memory file; do not treat either as the primary owner.",
     "Only answer when one of those two people is clearly addressing or including you. If a message is not for you, reply with exactly [SKIP].",
+    "After an owner wakes you in an active text or voice listening session, treat their follow-up messages in that session as addressed to you until it ends.",
     "You have no commands or server-management abilities. Never emit command tags or claim that you changed Discord settings, moderated users, or performed other external actions.",
     "Do not claim to join or leave voice; explicit voice-channel requests are handled by a separate bot action.",
-    "When connected to voice, your replies in the server's AI chat are spoken aloud. You can speak but cannot hear voice-channel audio.",
+    "When connected to voice, only Chakala and Darkfill are transcribed for you. Your replies are spoken aloud; do not claim to hear anyone else.",
     "You can understand images attached to a message. Describe them naturally when relevant.",
     "When someone explicitly asks for a voice reply, answer with concise, natural text suitable for speech. Avoid markdown, tables, long lists, and URLs.",
     `Authorized owners: ${owners}.`,
@@ -222,6 +228,38 @@ async function getAIResponse(message: Message, session: ListeningSession): Promi
   }
 }
 
+async function getVoiceAIResponse(
+  transcription: string,
+  ownerName: string,
+  session: ListeningSession,
+): Promise<string> {
+  const history: MistralMessage[] = session.history.map((entry) => ({
+    role: entry.role,
+    content:
+      entry.role === "user" && entry.authorName
+        ? `[${entry.authorName}]: ${entry.content}`
+        : entry.content,
+  }));
+  const messages: MistralMessage[] = [
+    { role: "system", content: buildSystemPrompt() },
+    ...history,
+    { role: "user", content: `[${ownerName}]: ${transcription}` },
+  ];
+
+  let timeoutId: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(
+      () => reject(new Error(`The Mistral request timed out after ${MISTRAL_TIMEOUT_MS / 1000} seconds.`)),
+      MISTRAL_TIMEOUT_MS,
+    );
+  });
+  try {
+    return await Promise.race([callMistral(messages), timeout]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
 async function sendText(message: Message, text: string): Promise<void> {
   const channel = message.channel;
   if (!("send" in channel)) throw new Error("This Discord channel cannot receive messages.");
@@ -302,6 +340,93 @@ async function sendReply(message: Message, text: string): Promise<void> {
   }
 }
 
+const voiceTurnQueues = new Map<string, Promise<void>>();
+
+async function processAmieVoiceAudio(
+  guildId: string,
+  voiceChannelId: string,
+  userId: string,
+  wavAudio: Buffer,
+): Promise<void> {
+  if (!isAuthorizedUser(userId)) return;
+
+  const ownerName = AUTHORIZED_USERS.get(userId);
+  if (!ownerName) return;
+
+  let transcription: string;
+  try {
+    transcription = await transcribeVoiceAudio(wavAudio);
+  } catch (error) {
+    console.error("[Amie] Voice transcription failed:", error);
+    return;
+  }
+  if (!transcription) return;
+
+  const session = amieState.getSession(guildId, voiceChannelId);
+  if (session && isSleepPhrase(transcription)) {
+    amieState.endSession(guildId, voiceChannelId);
+    await speakTextInVoiceChannel(guildId, "Okay, I'll be quiet.");
+    return;
+  }
+  if (!session && !isWakePhrase(transcription)) return;
+
+  const activeSession =
+    session ??
+    amieState.startSession(
+      guildId,
+      voiceChannelId,
+      parseDurationFromContent(transcription) ?? DEFAULT_LISTENING_MINUTES,
+      () => undefined,
+    );
+
+  try {
+    const raw = await getVoiceAIResponse(transcription, ownerName, activeSession);
+    amieState.addToHistory(
+      guildId,
+      voiceChannelId,
+      "user",
+      transcription,
+      userId,
+      ownerName,
+    );
+    if (isSkipReply(raw)) return;
+
+    const reply = cleanReply(raw);
+    if (!reply) return;
+    amieState.addToHistory(guildId, voiceChannelId, "assistant", reply);
+    await speakTextInVoiceChannel(guildId, reply);
+  } catch (error) {
+    console.error("[Amie] Voice conversation failed:", error);
+    await speakTextInVoiceChannel(
+      guildId,
+      getAIErrorMessage(error, "I couldn't answer that just now. Please try again."),
+    );
+  }
+}
+
+export function handleAmieVoiceAudio(
+  guildId: string,
+  voiceChannelId: string,
+  userId: string,
+  wavAudio: Buffer,
+): Promise<void> {
+  if (!isAuthorizedUser(userId)) return Promise.resolve();
+
+  const previous = voiceTurnQueues.get(guildId) ?? Promise.resolve();
+  const turn = previous
+    .catch(() => undefined)
+    .then(() => processAmieVoiceAudio(guildId, voiceChannelId, userId, wavAudio));
+  const queueTail = turn.then(
+    () => undefined,
+    () => undefined,
+  );
+  voiceTurnQueues.set(guildId, queueTail);
+  void queueTail.then(() => {
+    if (voiceTurnQueues.get(guildId) === queueTail) voiceTurnQueues.delete(guildId);
+  });
+  return turn;
+}
+
 async function handleVoiceChannelAction(
   message: Message,
   action: VoiceChannelAction,
@@ -338,9 +463,11 @@ async function handleVoiceChannelAction(
   }
 
   try {
-    const result = await joinAmieVoiceChannel(guild, channel);
+    const result = await joinAmieVoiceChannel(guild, channel, handleAmieVoiceAudio);
     const response =
-      result === "already" ? `I'm already in ${channel.name}.` : `I'm in ${channel.name} now.`;
+      result === "already"
+        ? `I'm already in ${channel.name}. Say "Amie" to talk.`
+        : `I'm in ${channel.name}. Say "Amie" to talk. Only Chakala and Darkfill's speech goes to Mistral for transcription; I don't save recordings.`;
     await sendText(message, response);
     await speakTextInVoiceChannel(guild.id, response);
   } catch (error) {
