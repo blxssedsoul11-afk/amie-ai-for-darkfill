@@ -10,9 +10,15 @@ import {
   SKIP_SIGNAL,
   isAuthorizedUser,
 } from "./config.js";
-import { prepareSpeechText, sendVoiceMessage, synthesizeVoice, wantsVoiceReply } from "./fish.js";
+import {
+  getReplyDelivery,
+  prepareSpeechText,
+  sendVoiceMessage,
+  synthesizeVoice,
+} from "./fish.js";
 import { amieMemory } from "./memory.js";
 import {
+  getAmieVoiceChannelId,
   isAmieVoiceConnectionReady,
   joinAmieVoiceChannel,
   leaveAmieVoiceChannel,
@@ -136,7 +142,7 @@ function buildSystemPrompt(): string {
     "Use no emojis by default. Rarely mirror an emoji when the user uses one or it clearly fits; if you do, use only ❤️💕😘🥳👀🫶🤞🤏👌🫵🙏💅, and never more than one per reply.",
     "You have two equal owners, Chakala and Darkfill. They share one memory file; do not treat either as the primary owner.",
     "Only answer when one of those two people is clearly addressing or including you. If a message is not for you, reply with exactly [SKIP].",
-    "After an owner wakes you in an active text or voice listening session, treat their follow-up messages in that session as addressed to you until it ends.",
+    "During an active session, treat direct follow-ups to your last answer as addressed to you. In voice, owners do not need to repeat your name, but ignore conversations clearly directed at each other.",
     "You have no commands or server-management abilities. Never emit command tags or claim that you changed Discord settings, moderated users, or performed other external actions.",
     "Do not claim to join or leave voice; explicit voice-channel requests are handled by a separate bot action.",
     "When connected to voice, only Chakala and Darkfill are transcribed for you. Your replies are spoken aloud; do not claim to hear anyone else.",
@@ -296,38 +302,36 @@ async function speakTextInVoiceChannel(guildId: string, text: string): Promise<b
 }
 
 async function sendReply(message: Message, text: string): Promise<void> {
-  const voiceReplyRequested = wantsVoiceReply(message.content);
   const guildId = message.guildId;
   const connectedToVoice = guildId ? isAmieVoiceConnectionReady(guildId) : false;
+  const delivery = getReplyDelivery(message.content, connectedToVoice);
 
-  if (!connectedToVoice && !voiceReplyRequested) {
+  if (delivery === "text") {
     await sendText(message, text);
     return;
   }
 
-  if (connectedToVoice) await sendText(message, text);
+  if (delivery === "voice-channel") await sendText(message, text);
 
   let audio: Awaited<ReturnType<typeof synthesizeVoice>>;
   try {
     audio = await synthesizeVoice(prepareSpeechText(text));
   } catch (error) {
     console.error("[Amie] Voice reply failed:", error);
-    if (!connectedToVoice) await sendText(message, text);
+    if (delivery === "voice-message") await sendText(message, text);
     return;
   }
 
-  if (connectedToVoice && guildId) {
+  if (delivery === "voice-channel" && guildId) {
     try {
       const spoken = await speakInAmieVoiceChannel(guildId, audio);
       if (spoken) return;
       throw new Error("Amie is no longer connected to voice.");
     } catch (error) {
       console.error("[Amie] Could not play the reply in voice:", error);
-      if (voiceReplyRequested) {
-        await sendVoiceReplyToTextChannel(message, audio).catch((fallbackError: unknown) => {
-          console.error("[Amie] Could not send a voice-message fallback:", fallbackError);
-        });
-      }
+      await sendVoiceReplyToTextChannel(message, audio).catch((fallbackError: unknown) => {
+        console.error("[Amie] Could not send a voice-message fallback:", fallbackError);
+      });
       return;
     }
   }
@@ -438,9 +442,8 @@ async function handleVoiceChannelAction(
   }
 
   if (action === "leave") {
-    if (isAmieVoiceConnectionReady(guild.id)) {
-      await speakTextInVoiceChannel(guild.id, "Okay, I'll leave now.");
-    }
+    const voiceChannelId = getAmieVoiceChannelId(guild.id);
+    if (voiceChannelId) amieState.endSession(guild.id, voiceChannelId);
     const left = leaveAmieVoiceChannel(guild.id);
     await sendText(message, left ? "I've left the voice channel." : "I'm not in a voice channel right now.");
     return;
@@ -463,13 +466,24 @@ async function handleVoiceChannelAction(
   }
 
   try {
+    const previousVoiceChannelId = getAmieVoiceChannelId(guild.id);
     const result = await joinAmieVoiceChannel(guild, channel, handleAmieVoiceAudio);
+    if (previousVoiceChannelId && previousVoiceChannelId !== channel.id) {
+      amieState.endSession(guild.id, previousVoiceChannelId);
+    }
+    if (!amieState.getSession(guild.id, channel.id)) {
+      amieState.startSession(
+        guild.id,
+        channel.id,
+        DEFAULT_LISTENING_MINUTES,
+        () => undefined,
+      );
+    }
     const response =
       result === "already"
-        ? `I'm already in ${channel.name}. Say "Amie" to talk.`
-        : `I'm in ${channel.name}. Say "Amie" to talk. Only Chakala and Darkfill's speech goes to Mistral for transcription; I don't save recordings.`;
+        ? `I'm already in ${channel.name} and listening.`
+        : `I'm in ${channel.name} and listening. Speak naturally. Only Chakala and Darkfill are transcribed by Mistral; I don't save recordings.`;
     await sendText(message, response);
-    await speakTextInVoiceChannel(guild.id, response);
   } catch (error) {
     console.warn("[Amie] Could not join the requested voice channel:", error);
     await sendText(message, "I couldn't connect. Please check that I have permission to join that channel.");

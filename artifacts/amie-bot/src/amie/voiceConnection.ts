@@ -104,6 +104,10 @@ export function isAmieVoiceConnectionReady(guildId: string): boolean {
   return getVoiceConnection(guildId)?.state.status === VoiceConnectionStatus.Ready;
 }
 
+export function getAmieVoiceChannelId(guildId: string): string | null {
+  return getVoiceConnection(guildId)?.joinConfig.channelId ?? null;
+}
+
 function getAudioPlayer(guildId: string, connection: VoiceConnection): AudioPlayer {
   const existing = audioPlayers.get(guildId);
   if (existing?.connection === connection) return existing.player;

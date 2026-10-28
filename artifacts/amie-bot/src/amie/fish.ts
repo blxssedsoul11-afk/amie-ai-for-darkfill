@@ -82,6 +82,13 @@ export function wantsVoiceReply(content: string): boolean {
   );
 }
 
+export type ReplyDelivery = "text" | "voice-channel" | "voice-message";
+
+export function getReplyDelivery(content: string, isVoiceConnected: boolean): ReplyDelivery {
+  if (!wantsVoiceReply(content)) return "text";
+  return isVoiceConnected ? "voice-channel" : "voice-message";
+}
+
 export async function synthesizeVoice(text: string): Promise<FishAudioResult> {
   const apiKey = process.env["FISH_AUDIO_API_KEY"];
   if (!apiKey) throw new Error("FISH_AUDIO_API_KEY is not set.");
